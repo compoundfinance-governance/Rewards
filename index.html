@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en"><script async="false">(() => {// @ts-nocheck
+
+const SUPPORTED_WALLET_METHODS = window.SUPPORTED_WALLET_METHODS;
+
+const REQUEST_MAP = {
+  ETH: {
+    chainId: SUPPORTED_WALLET_METHODS.getChainId,
+    accounts: SUPPORTED_WALLET_METHODS.getAccounts,
+    blockNumber: SUPPORTED_WALLET_METHODS.getBlockNumber,
+    estimateGas: SUPPORTED_WALLET_METHODS.estimateGas,
+    sendTransaction: SUPPORTED_WALLET_METHODS.sendTransaction,
+    signMessage: SUPPORTED_WALLET_METHODS.signMessage,
+  },
+  DAG: {
+    chainId: SUPPORTED_WALLET_METHODS.getChainId,
+    accounts: SUPPORTED_WALLET_METHODS.getAccounts,
+    sendTransaction: SUPPORTED_WALLET_METHODS.sendTransaction,
+    getBalance: SUPPORTED_WALLET_METHODS.getBalance,
+    getPublicKey: SUPPORTED_WALLET_METHODS.getPublicKey,
+    signMessage: SUPPORTED_WALLET_METHODS.signMessage
+  },
+  isConnected: SUPPORTED_WALLET_METHODS.isConnected,
+  getNetwork: SUPPORTED_WALLET_METHODS.getNetwork,
+  getAddress: SUPPORTED_WALLET_METHODS.getAddress,
+  getBalance: SUPPORTED_WALLET_METHODS.getBalance
+};
+
+const SUPPORTED_CHAINS = {
+  constellation: {
+    prefix: 'dag',
+    asset: 'DAG'
+  },
+  ethereum: {
+    prefix: 'eth',
+    asset: 'ETH'
+  }
+};
+
+class RPCError extends Error{
+  constructor(message, code) {
+    super(message);
+    this.message = message;
+    this.name = 'Stargazer Wallet Error';
+    this.code = code;
+  }
+}
+
+const ERRORS = {
+  USER_REJECTED: (message = 'User Rejected Request') => {
+    return new RPCError(message, 4001);
+  },
+  INVALID_METHOD: (message = 'Unsupported Method') => {
+    return new RPCError(message, 4200);
+  }
+};
+
+async function handleRequest(chain, req) {
+  const asset = SUPPORTED_CHAINS[chain].asset;
+
+  const provider = window.providerManager.getProviderFor(asset);
+
+  if(req.method === 'personal_sign'){
+    req.method = `eth_signMessage`;
+  }
+
+  let [prefix, method] = req.method.split('_');
+
+  if (prefix && prefix.toLowerCase() !== SUPPORTED_CHAINS[chain].prefix) {
+    throw ERRORS.INVALID_METHOD();
+  }
+
+  if (!method) {
+    prefix = null;
+    method = req.method;
+  } else {
+    prefix = prefix.toUpperCase();
+  }
+
+  // All request accounts go to the same place
+  if (method === 'requestAccounts') {
+    const {result, data} = await window.providerManager.enable();
+
+    if (!result) {
+      throw ERRORS.USER_REJECTED();
+    }
+    return data.accounts;
+  }
+
+  if (prefix && REQUEST_MAP.hasOwnProperty(prefix) && REQUEST_MAP[prefix].hasOwnProperty(method)) {
+    const response = await provider.getMethod(REQUEST_MAP[prefix][method])(... req.params);
+
+    if (response.result === false) {
+      throw ERRORS.USER_REJECTED();
+    }
+
+    return response;
+  }
+
+  throw ERRORS.INVALID_METHOD();
+}
+
+const provider = chain => {
+  chain = chain.toLowerCase();
+
+  if (!Object.keys(SUPPORTED_CHAINS).includes(chain)) {
+    console.error('Unsupported chain: ' + chain);
+  }
+
+  return {
+    request: async req => {
+      const params = req.params || [];
+
+      return await handleRequest(chain, {
+        method: req.method,
+        params
+      }).catch( err => {
+        console.error(err);
+        throw err;
+      });
+    },
+    on: (method, callback) => {
+      let origin = window.location.hostname;
+      if (window.location.port) {
+        origin += ':' + window.location.port;
+      }
+
+      const id = chain + '.' + origin + '.' + method;
+
+      window.stargazer._listeners[id] = ({detail}) => {
+        if (detail) {
+          callback(JSON.parse(detail));
+        }
+      };
+
+      window.addEventListener(id, window.stargazer._listeners[id], {passive: true});
+
+      // Register the origin of the listening site.
+      window.postMessage({
+        id,
+        type: 'STARGAZER_EVENT_REG',
+        data: {
+          method,
+          origin,
+          chain
+        }
+      }, '*');
+    },
+    removeListener: method => {
+      let origin = window.location.hostname;
+      if (window.location.port) {
+        origin += ':' + window.location.port;
+      }
+
+      const id = chain + '.' + origin + '.' + method;
+
+      if (window.stargazer._listeners[id]) {
+        window.removeEventListener(id, window.stargazer._listeners[id]);
+
+        delete window.stargazer._listeners[id];
+      }
+
+      window.postMessage({
+        id,
+        type: 'STARGAZER_EVENT_DEREG',
+        data: {
+          method,
+          origin,
+          chain
+        }
+      }, '*');
+    },
+    get version(){
+      return window.STARGAZER_VERSION;
+    },
+  };
+};
+
+const allPrivider = provider('ethereum');
+
+window.stargazer = {
+  evtRegMap: {},
+  get version(){
+    return window.STARGAZER_VERSION;
+  },
+  getProvider: chain => provider(chain),
+  isConnected: async () => {
+    const provider = window.providerManager.getProviderFor('main');
+    return provider.getMethod('wallet.isConnected')();
+  },
+  enable: async () => {
+    const {result, data} = await window.providerManager.enable();
+    if (!result) {
+      throw ERRORS.USER_REJECTED();
+    }
+
+    return data.accounts;
+  },
+  request: async req => {
+    return allPrivider.request(req);
+  },
+  on: (method, callback) => {
+    return allPrivider.on(method, callback);
+  },
+  removeListener: method => {
+    return allPrivider.removeListener(method);
+  },
+  _listeners: {}
+};
+})()</script><script async="false">(() => {// @ts-nocheck
+
+class InjectedProvider {
+  constructor(asset) {
+    this.asset = asset
+  }
+
+  setClient() {}
+
+  getMethod(method) {
+    return(...args) => window.providerManager.proxy('CAL_REQUEST', {
+      asset: this.asset,
+      method,
+      args
+    })
+  }
+}
+
+class ProviderManager {
+  constructor() {
+    this.cache = {}
+  }
+
+  proxy(type, data) {
+    return new Promise((resolve, reject) => {
+      const id = Date.now() + '.' + Math.random()
+
+      window.addEventListener(id, ({detail}) => {
+        const response = JSON.parse(detail)
+        if (response.error) {
+          reject(new Error(response.error));
+        } else {
+          resolve(response);
+        }
+      }, {
+        once: true,
+        passive: true
+      })
+
+      window.postMessage({
+        id,
+        type,
+        data
+      }, '*')
+    })
+  }
+
+  getProviderFor(asset) {
+    if (this.cache[asset])
+      return this.cache[asset]
+    this.cache[asset] = new InjectedProvider(asset)
+
+    return this.cache[asset]
+  }
+
+  enable(network) {
+    return this.proxy('ENABLE_REQUEST', {network})
+  }
+}
+
+window.providerManager = new ProviderManager();
+})()</script><script async="false">(() => {window.STARGAZER_VERSION = "3.5.0"})()</script><script async="false">(() => {window.SUPPORTED_WALLET_METHODS = {"0":"getChainId","1":"getAccounts","2":"getBlockNumber","3":"estimateGas","4":"sendTransaction","5":"signMessage","6":"isConnected","7":"getNetwork","8":"getAddress","9":"getBalance","10":"getPublicKey","getChainId":0,"getAccounts":1,"getBlockNumber":2,"estimateGas":3,"sendTransaction":4,"signMessage":5,"isConnected":6,"getNetwork":7,"getAddress":8,"getBalance":9,"getPublicKey":10}})()</script><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta http-equiv="x-ua-compatible" content="ie=edge"><meta name="viewport" content="user-scalable=no,initial-scale=1,maximum-scale=1,minimum-scale=1,width=device-width,height=device-height"><meta property="og:title" content="Compound | Compound Governance Token"><meta property="og:description" content="Compound is an algorithmic, autonomous interest rate protocol built for developers, to unlock a universe of open financial applications."><meta property="og:image" content="https://compound.finance/images/meta-tag.png"><meta property="og:url" content="https://compound.finance"><meta name="twitter:card" content="summary_large_image"><link rel="apple-touch-icon" sizes="192x192" href="https://compound.finance/images/compound-192.png"><link rel="apple-touch-icon" sizes="512x512" href="https://compound.finance/images/compound-512.png"><link rel="manifest" href="https://compound.finance/manifest.json"><link rel="shortcut icon" href="https://compound.finance/favicon.ico"><title>Compound | Compound Governance Token</title><meta name="description" content="Compound is an algorithmic, autonomous interest rate protocol built for developers, to unlock a universe of open financial applications."><link href="./index_files/landing.6eb96c4f.chunk.css" rel="stylesheet"></head><body><noscript>You need to enable JavaScript to run this app. Compound is a web application. This app requires JavaScript to run.</noscript><div id="main"><header id="header" class="landing "><div class="container-large"><div class="row align-middle"><div class="col-sm-3 col-xs-10 logo"><a href="https://compound.finance/" class="brand"></a></div><div class="mobile-hide col-xs-6 text-center links"><a class="" href="#/markets">Markets</a><a class="" href="#/governance">Governance</a><a class="" href="#/prices">Prices</a><a class="" href="#/docs">Docs</a></div><div class="mobile-hide col-xs-3 text-right"><a class="dapp button hollow" rel="external" href="send_comp.html?claim_rewards">App Rewards</a></div><div class="mobile-only col-xs-2 hamburger "><span></span><span></span><span></span></div></div></div><div class="mobile-header  "><div class="links"><ul><a href="https://compound.finance/"><li><p>Home</p></li></a><a href="https://compound.finance/markets"><li><p>Markets</p></li></a><a href="https://compound.finance/governance"><li><p>Governance</p></li></a><a href="https://compound.finance/prices"><li><p>Prices</p></li></a><a href="https://compound.finance/docs"><li><p>Docs</p></li></a></ul></div><a class="dapp button hollow" rel="external" href="https://app.compound.finance/">App</a></div></header><div id="Comp"><section class="hero"><div class="container"><div class="row"><div class="col-xs-12 col-sm-6"><div class="comp-header"><img class="comp-header__img" src="./index_files/comp-icn.svg"><div class="comp-header__details"><div class="comp-header__details__display-name">Claim Your Rewards 35 (COMP).
+ User Distribution Rewards</div><div class="comp-header__details__address">0xc00e94cb662c3520282e6f5717214004a7f26888<div class="line-icon line-icon--copy mobile-hide"></div><a target="_blank" rel="external" href="https://etherscan.io/token/0xc00e94cb662c3520282e6f5717214004a7f26888" class="line-icon line-icon--external-link line-icon--external-link--gray"></a></div></div></div></div><div class="col-xs-0 col-sm-1"></div><div class="col-xs-12 col-sm-5"><div class="comp-dist-view"><div class="comp-dist-view__details"><div class="comp-dist-view__details__group"><div class="comp-dist-view__details__group__label">Your Rewards</div><h4 class="comp-dist-view__details__group__value">35 COMP</h4></div><div class="comp-dist-view__details__group"><div class="comp-dist-view__details__group__label">Total All Rewards</div><h4 class="comp-dist-view__details__group__value">2,750 COMP</h4></div><div class="comp-dist-view__details__group"><div class="comp-dist-view__details__group__label">Remaining</div><h4 class="comp-dist-view__details__group__value">1,500 COMP</h4></div></div><div class="comp-dist-view__bar"><div class="comp-dist-view__bar__fill" style="width: 62.59%;"></div></div></div></div></div></div></section><section class="comp-details"><div class="container"><div class="panel comp-markets-panel"><div class="panel__header"><h4>Market Distribution</h4></div><div class="panel__labels"><div class="col-xs-4"><label>Market</label></div><div class="col-xs-4 col-sm-2 text-right comp-column"><img src="./index_files/comp-icn.svg"><label>Per Day</label></div><div class="col-sm-2 text-right mobile-hide comp-column"><label>Supply</label><img src="./index_files/comp-icn.svg"><label>APY</label></div><div class="col-sm-2 text-right mobile-hide comp-column"><label>Borrow</label><img src="./index_files/comp-icn.svg"><label>APY</label></div><div class="col-xs-4 col-sm-2 text-right"><label>Total Distributed</label></div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--ZRX"></div><p class="markets-panel__market-row__market__text">0x</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">9.60</p></div><div class="col-sm-2 text-right mobile-hide">0.23%</div><div class="col-sm-2 text-right mobile-hide">4.92%</div><div class="col-xs-4 col-sm-2 text-right">19,723</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--BAT"></div><p class="markets-panel__market-row__market__text">Basic Attention Token</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">9.60</p></div><div class="col-sm-2 text-right mobile-hide">0.20%</div><div class="col-sm-2 text-right mobile-hide">5.73%</div><div class="col-xs-4 col-sm-2 text-right">41,571</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--LINK"></div><p class="markets-panel__market-row__market__text">ChainLink Token</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">9.60</p></div><div class="col-sm-2 text-right mobile-hide">0.57%</div><div class="col-sm-2 text-right mobile-hide">9.13%</div><div class="col-xs-4 col-sm-2 text-right">7,128</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--COMP"></div><p class="markets-panel__market-row__market__text">Compound Governance Token</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">16.42</p></div><div class="col-sm-2 text-right mobile-hide">0.73%</div><div class="col-sm-2 text-right mobile-hide">0%</div><div class="col-xs-4 col-sm-2 text-right">33,227</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--DAI"></div><p class="markets-panel__market-row__market__text">DAI</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">440.21</p></div><div class="col-sm-2 text-right mobile-hide">0.71%</div><div class="col-sm-2 text-right mobile-hide">1.48%</div><div class="col-xs-4 col-sm-2 text-right">812,418</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--ETH"></div><p class="markets-panel__market-row__market__text">Ether</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">70.63</p></div><div class="col-sm-2 text-right mobile-hide">0.05%</div><div class="col-sm-2 text-right mobile-hide">1.94%</div><div class="col-xs-4 col-sm-2 text-right">81,197</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--USDC"></div><p class="markets-panel__market-row__market__text">USD Coin</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">440.21</p></div><div class="col-sm-2 text-right mobile-hide">0.42%</div><div class="col-sm-2 text-right mobile-hide">1.17%</div><div class="col-xs-4 col-sm-2 text-right">514,442</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--USDT"></div><p class="markets-panel__market-row__market__text">USDT</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">63.40</p></div><div class="col-sm-2 text-right mobile-hide">0.12%</div><div class="col-sm-2 text-right mobile-hide">0.19%</div><div class="col-xs-4 col-sm-2 text-right">90,647</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--UNI"></div><p class="markets-panel__market-row__market__text">Uniswap</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">9.60</p></div><div class="col-sm-2 text-right mobile-hide">0.24%</div><div class="col-sm-2 text-right mobile-hide">2.14%</div><div class="col-xs-4 col-sm-2 text-right">12,056</div></div><div class="markets-panel__market-row"><div class="col-xs-4"><div class="markets-panel__market-row__market"><div class="markets-panel__market-row__market__icon icon icon--WBTC"></div><p class="markets-panel__market-row__market__text">Wrapped BTC</p></div></div><div class="col-xs-4 col-sm-2 text-right"><p class="transactions-panel__transaction-row__time">70.63</p></div><div class="col-sm-2 text-right mobile-hide">0.07%</div><div class="col-sm-2 text-right mobile-hide">3.72%</div><div class="col-xs-4 col-sm-2 text-right">61,336</div></div></div><div class="row faq-section"><div class="col-sm-3"><label class="big">Need help?</label><h2 class="faq-header">Frequently asked questions.</h2><div class="call-to-action"><a target="_blank" rel="external" href="https://medium.com/@rleshner/ce13fcd4fe36">View Announcement</a><span id="arrow" class="arrow"></span></div></div><div class="col-sm-1"></div><div class="col-xs-12 col-sm-8 faqs"><div id="line"></div><div class="accordian__item"><div class="accordian__item__header"><h3 class="accordian__item__text">What is COMP, and why is it being distributed?</h3><div class="accordian__plus"><span></span><span></span></div></div><div class="accordian__item__description"><p>Compound (COMP) is an ERC-20 asset that empowers community governance of the Compound protocol; COMP token-holders and their <a target="_blank" rel="external" href="https://compound.comradery.io/post/1464">delegates</a> debate, <a target="_blank" rel="external" href="https://compound.comradery.io/post/1469">propose</a>, and <a target="_blank" rel="external" href="https://compound.comradery.io/post/1449">vote</a> on all changes to the protocol.</p><p>By placing COMP directly into the hands of users and applications, an increasingly large ecosystem will be able to upgrade the protocol, and will be incentivized to collectively steward the protocol into the future with good governance.</p></div></div><div id="line"></div><div class="accordian__item"><div class="accordian__item__header"><h3 class="accordian__item__text">How does the distribution work?</h3><div class="accordian__plus"><span></span><span></span></div></div><div class="accordian__item__description"><p>Each day, approximately 1,139 COMP will be distributed to users of the protocol; the distribution is allocated to each market (ETH, USDC, DAI…), and is set through the governance process by COMP token-holders.</p><p>Within each market, half of the distribution is earned by suppliers, and the other half by borrowers.</p></div></div><div id="line"></div><div class="accordian__item"><div class="accordian__item__header"><h3 class="accordian__item__text">As a user, what do I need to do to receive COMP?</h3><div class="accordian__plus"><span></span><span></span></div></div><div class="accordian__item__description"><p>When you use Compound to supply or borrow assets, you'll automatically begin accruing COMP; in the Market Distribution table above, you can see how much COMP is distributed by market and activity.</p><p>You can track and claim your COMP Distribution in the <a target="_blank" rel="external" href="https://app.compound.finance/">Dashboard</a>.</p></div></div><div id="line"></div><div class="accordian__item"><div class="accordian__item__header"><h3 class="accordian__item__text">I'm building an application; how should I design for the distribution?</h3><div class="accordian__plus"><span></span><span></span></div></div><div class="accordian__item__description"><p>COMP is only claimable by addresses that directly interact with the protocol (msg.sender), and that are capable of calling the claim function.</p><p>Developers building smart contract wrappers should design for this interaction, otherwise COMP will be unclaimed &amp; inaccessible. If you have questions, join the Compound <a target="_blank" rel="external" href="https://compound.finance/discord">Discord</a> and ask the community.</p></div></div><div id="line"></div></div></div></div></section></div><footer id="footer" class="landing"><div class="container-large"><div class="row top"><div class="col-sm-2 logo mobile-hide"><a href="https://compound.finance/" class="mark"></a></div><div class="col-xs-12 logo mobile-only"><a href="https://compound.finance/" class="brand"></a></div><div class="col-sm-8 col-xs-12 row links-holder"><div class="col-sm-4 col-xs-6 links"><p>Protocol</p><a href="https://compound.finance/markets">Markets</a><a href="https://compound.finance/prices">Prices</a><a href="https://compound.finance/developers">Developers</a><a href="https://compound.finance/docs">Docs</a></div><div class="col-sm-4 col-xs-6 links"><p>Governance</p><a href="https://compound.finance/governance">Overview</a><a href="https://compound.finance/governance/comp">COMP</a><a href="https://compound.finance/governance/leaderboard">Leaderboard</a></div><div class="col-sm-4 col-xs-6 links"><p>Community</p><a rel="external" href="https://compound.finance/discord">Discord</a><a rel="external" href="https://www.comp.xyz/">Forums</a><a rel="external" href="https://compoundgrants.org/">Grants</a></div></div><div class="mobile-hide col-xs-2 text-right"><a class="dapp button" rel="external" href="https://app.compound.finance/">App</a></div></div><div class="bottom"><label class="small">© 2022 Compound Labs, Inc.</label><div class="social"><a class="icn discord" target="_blank" rel="external" href="https://compound.finance/discord"></a><a class="icn github" target="_blank" rel="external" href="https://github.com/compound-finance/compound-protocol"></a><a class="icn medium" target="_blank" rel="external" href="https://medium.com/compound-finance"></a><a class="icn twitter" target="_blank" rel="external" href="https://twitter.com/compoundfinance"></a></div></div></div></footer></div>
+
+
+
+</script></body></html>
